@@ -1,5 +1,6 @@
 """MCP server with HTTP Bearer-token authentication at the transport boundary."""
 import hmac
+import ipaddress
 import json
 import os
 
@@ -8,9 +9,28 @@ from mcp.server.fastmcp import FastMCP
 
 import core
 
-HOST = os.environ.get("HOST", "0.0.0.0")
+HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", 8000))
 _API_TOKEN = os.environ.get("MCP_API_TOKEN", "")
+
+
+def validate_deployment_config(host=HOST, environ=None):
+    """Require explicit acknowledgement before exposing the HTTP service remotely."""
+    env = os.environ if environ is None else environ
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.strip().lower() == "localhost"
+    if not loopback and not (
+        env.get("ALLOW_REMOTE_BIND") == "1"
+        and env.get("TRUSTED_TLS_TERMINATION") == "1"
+    ):
+        raise SystemExit(
+            "Remote binding requires ALLOW_REMOTE_BIND=1 and "
+            "TRUSTED_TLS_TERMINATION=1; configure and verify a trusted TLS proxy."
+        )
+    return True
+
 
 mcp = FastMCP(
     "verification-controller",
@@ -29,7 +49,6 @@ def _token_is_valid(scope) -> bool:
         value for name, value in scope.get("headers", [])
         if name.lower() == b"authorization"
     ]
-    # Ambiguous duplicate credentials are rejected rather than choosing one.
     if len(authorization_values) != 1:
         return False
     try:
@@ -37,7 +56,7 @@ def _token_is_valid(scope) -> bool:
     except (AttributeError, UnicodeDecodeError):
         return False
     scheme, separator, credential = supplied.partition(" ")
-    if not separator or scheme.lower() != "bearer" or not credential:
+    if not separator or scheme.lower() != "bearer" or not credential or credential.strip() != credential:
         return False
     return hmac.compare_digest(credential, _API_TOKEN)
 
@@ -52,7 +71,7 @@ class BearerAuthMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path") == "/mcp":
             if not self.token_is_valid(scope):
-                body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+                body = b'{"error":"unauthorized"}'
                 await send({
                     "type": "http.response.start",
                     "status": 401,
@@ -104,5 +123,6 @@ def list_claims() -> list:
 if __name__ == "__main__":
     if not _API_TOKEN:
         raise SystemExit("Set MCP_API_TOKEN before starting; refusing to run without authentication.")
+    validate_deployment_config()
     app = BearerAuthMiddleware(mcp.streamable_http_app(), _token_is_valid)
     uvicorn.run(app, host=HOST, port=PORT)
