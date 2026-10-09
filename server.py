@@ -1,4 +1,4 @@
-"""MCP server with HTTP Bearer-token authentication at the transport boundary."""
+""""MCP server with HTTP Bearer-token authentication at the transport boundary."""
 import hmac
 import json
 import os
@@ -22,17 +22,24 @@ mcp = FastMCP(
 
 
 def _token_is_valid(scope) -> bool:
-    """Validate Authorization: Bearer ... without placing secrets in tool arguments."""
+    """Validate exactly one Authorization: Bearer header without exposing secrets."""
     if not _API_TOKEN:
         return False
-    supplied = None
-    for name, value in scope.get("headers", []):
-        if name.lower() == b"authorization":
-            supplied = value.decode("latin-1")
-            break
-    if not supplied or not supplied.startswith("Bearer "):
+    authorization_values = [
+        value for name, value in scope.get("headers", [])
+        if name.lower() == b"authorization"
+    ]
+    # Ambiguous duplicate credentials are rejected rather than choosing one.
+    if len(authorization_values) != 1:
         return False
-    return hmac.compare_digest(supplied[7:], _API_TOKEN)
+    try:
+        supplied = authorization_values[0].decode("latin-1")
+    except (AttributeError, UnicodeDecodeError):
+        return False
+    scheme, separator, credential = supplied.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not credential:
+        return False
+    return hmac.compare_digest(credential, _API_TOKEN)
 
 
 class BearerAuthMiddleware:
