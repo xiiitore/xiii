@@ -1,37 +1,128 @@
+"""MCP server with HTTP Bearer-token authentication at the transport boundary."""
+import hmac
+import ipaddress
+import json
 import os
+
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+
 import core
 
-mcp = FastMCP("verification-controller", stateless_http=True, json_response=True,
-              host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", 8000))
+_API_TOKEN = os.environ.get("MCP_API_TOKEN", "")
+
+
+def validate_deployment_config(host=HOST, environ=None):
+    """Require explicit acknowledgement before exposing the HTTP service remotely."""
+    env = os.environ if environ is None else environ
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.strip().lower() == "localhost"
+    if not loopback and not (
+        env.get("ALLOW_REMOTE_BIND") == "1"
+        and env.get("TRUSTED_TLS_TERMINATION") == "1"
+    ):
+        raise SystemExit(
+            "Remote binding requires ALLOW_REMOTE_BIND=1 and "
+            "TRUSTED_TLS_TERMINATION=1; configure and verify a trusted TLS proxy."
+        )
+    return True
+
+
+mcp = FastMCP(
+    "verification-controller",
+    stateless_http=True,
+    json_response=True,
+    host=HOST,
+    port=PORT,
+)
+
+
+def _token_is_valid(scope) -> bool:
+    """Validate exactly one Authorization: Bearer header without exposing secrets."""
+    if not _API_TOKEN:
+        return False
+    authorization_values = [
+        value for name, value in scope.get("headers", [])
+        if name.lower() == b"authorization"
+    ]
+    if len(authorization_values) != 1:
+        return False
+    try:
+        supplied = authorization_values[0].decode("latin-1")
+    except (AttributeError, UnicodeDecodeError):
+        return False
+    scheme, separator, credential = supplied.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not credential or credential.strip() != credential:
+        return False
+    return hmac.compare_digest(credential, _API_TOKEN)
+
+
+class BearerAuthMiddleware:
+    """Small ASGI middleware protecting the MCP HTTP endpoint."""
+
+    def __init__(self, app, token_is_valid):
+        self.app = app
+        self.token_is_valid = token_is_valid
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            if not self.token_is_valid(scope):
+                body = b'{"error":"unauthorized"}'
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                        (b"www-authenticate", b"Bearer"),
+                        (b"cache-control", b"no-store"),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
 
 @mcp.tool()
 def recompute_check(expression: str, claimed_result: float, rel_tolerance: float = 1e-6) -> dict:
-    """Neovisno preračunaj matematički izraz (npr. '1200000/850000') i usporedi s tvrdnjom.
-    Koristi prije nego što bilo koji broj proglasiš VERIFIED."""
-    try: return core.check_number(expression, claimed_result, rel_tolerance)
-    except Exception as e: return {"error": str(e)}
+    """Recompute a bounded mathematical expression and compare it with a claim."""
+    try:
+        return core.check_number(expression, claimed_result, rel_tolerance)
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return {"error": str(exc)}
+
 
 @mcp.tool()
 def register_claim(claim: str, source_tool: str = "") -> dict:
-    """Upiši tvrdnju/rezultat u evidenciju. Počinje u stanju EXECUTED."""
+    """Record a claim in the ledger with initial state EXECUTED."""
     return core.register(claim, source_tool)
+
 
 @mcp.tool()
 def advance_claim(claim_id: str, new_state: str, evidence: str = "") -> dict:
-    """Unaprijedi tvrdnju točno jedan korak: EXECUTED->VALID->VERIFIED->ACCEPTED,
-    ili odbaci s 'REJECTED'. Svaki korak traži dokaz u 'evidence'."""
+    """Advance a claim one state at a time or reject it with a reason."""
     return core.advance(claim_id, new_state, evidence)
+
 
 @mcp.tool()
 def get_claim(claim_id: str) -> dict:
-    """Vrati stanje i povijest jedne tvrdnje."""
+    """Return the current state and history of one claim."""
     return core.get(claim_id)
+
 
 @mcp.tool()
 def list_claims() -> list:
-    """Popis svih tvrdnji i njihovih stanja."""
+    """List claim IDs, text, and current states."""
     return core.listing()
 
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")   # endpoint: /mcp
+    if not _API_TOKEN:
+        raise SystemExit("Set MCP_API_TOKEN before starting; refusing to run without authentication.")
+    validate_deployment_config()
+    app = BearerAuthMiddleware(mcp.streamable_http_app(), _token_is_valid)
+    uvicorn.run(app, host=HOST, port=PORT)
