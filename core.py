@@ -1,7 +1,8 @@
 """Bounded arithmetic evaluation and a durable claim ledger.
 
-The ledger is a local single-process store, not a distributed database. Deployments
-must provide private network access and persistent storage.
+The local JSON ledger uses POSIX advisory file locking to prevent lost updates
+across cooperating processes. Use a local filesystem; network filesystems and
+non-POSIX platforms are outside the supported concurrency boundary.
 """
 import ast
 import json
@@ -12,6 +13,8 @@ import tempfile
 import threading
 import time
 import uuid
+
+from ledger_lock import locked_ledger
 
 MAX_EXPRESSION_LENGTH = 512
 MAX_AST_NODES = 64
@@ -103,16 +106,17 @@ PATH = os.environ.get("LEDGER_PATH", "ledger.json")
 
 
 def _load():
-    """Missing ledger means empty; corruption or I/O errors must not look empty."""
+    """Missing ledger means empty; corruption or I/O errors fail closed."""
     try:
         with open(PATH, encoding="utf-8") as stream:
             data = json.load(stream)
     except FileNotFoundError:
         return {}
-    except (json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError(f"ledger nije moguće sigurno učitati: {exc}") from exc
+    except (json.JSONDecodeError, OSError):
+        # Do not echo filesystem paths or raw decoder details to callers.
+        raise RuntimeError("ledger cannot be read safely") from None
     if not isinstance(data, dict):
-        raise RuntimeError("ledger mora biti JSON objekt")
+        raise RuntimeError("ledger format is invalid")
     return data
 
 
@@ -125,6 +129,12 @@ def _save(data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, PATH)
+        # Persist the directory entry where supported by the local filesystem.
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         try:
             if os.path.exists(temporary):
@@ -133,6 +143,7 @@ def _save(data):
             pass
 
 
+@locked_ledger(lambda: PATH)
 def register(claim, source_tool=""):
     if not isinstance(claim, str) or not claim.strip():
         raise ValueError("claim mora biti neprazan tekst")
@@ -149,6 +160,7 @@ def register(claim, source_tool=""):
         return item
 
 
+@locked_ledger(lambda: PATH)
 def advance(cid, new_state, evidence):
     if not isinstance(evidence, str):
         raise TypeError("evidence mora biti tekst")
@@ -175,11 +187,13 @@ def advance(cid, new_state, evidence):
         return claim
 
 
+@locked_ledger(lambda: PATH)
 def get(cid):
     with _LEDGER_LOCK:
         return _load().get(cid, {"error": "nepoznat id"})
 
 
+@locked_ledger(lambda: PATH)
 def listing():
     with _LEDGER_LOCK:
         return [{"id": item["id"], "claim": item["claim"], "state": item["state"]}
