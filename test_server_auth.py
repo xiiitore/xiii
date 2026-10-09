@@ -7,18 +7,20 @@ import server
 
 
 class ServerAuthTests(unittest.TestCase):
-    def setUp(self):
-        self.token_patch = patch.object(server, "_API_TOKEN", "test-secret")
-        self.token_patch.start()
-        self.app = server.BearerAuthMiddleware(
+    @classmethod
+    def setUpClass(cls):
+        cls.token_patch = patch.object(server, "_API_TOKEN", "test-secret")
+        cls.token_patch.start()
+        cls.app = server.BearerAuthMiddleware(
             server.mcp.streamable_http_app(), server._token_is_valid
         )
-        self.client = TestClient(self.app)
-        self.client.__enter__()
+        cls.client = TestClient(cls.app)
+        cls.client.__enter__()
 
-    def tearDown(self):
-        self.client.__exit__(None, None, None)
-        self.token_patch.stop()
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+        cls.token_patch.stop()
 
     def test_real_mcp_route_rejects_missing_and_wrong_credentials(self):
         self.assertEqual(self.client.post("/mcp", json={}).status_code, 401)
