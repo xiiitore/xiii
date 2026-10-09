@@ -32,6 +32,7 @@ class BearerAuthTests(unittest.IsolatedAsyncioTestCase):
             reached.append(True)
 
         middleware = server.BearerAuthMiddleware(app, server._token_is_valid)
+
         async def send(message):
             raise AssertionError("valid request should be handled by app")
 
@@ -52,6 +53,27 @@ class BearerAuthTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch.object(server, "_API_TOKEN", ""):
             self.assertFalse(server._token_is_valid(scope))
+
+    async def test_duplicate_authorization_headers_are_rejected(self):
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "headers": [
+                (b"authorization", b"Bearer expected-secret"),
+                (b"authorization", b"Bearer attacker-value"),
+            ],
+        }
+        with patch.object(server, "_API_TOKEN", "expected-secret"):
+            self.assertFalse(server._token_is_valid(scope))
+
+    async def test_bearer_scheme_is_case_insensitive(self):
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "headers": [(b"authorization", b"bEaReR expected-secret")],
+        }
+        with patch.object(server, "_API_TOKEN", "expected-secret"):
+            self.assertTrue(server._token_is_valid(scope))
 
 
 if __name__ == "__main__":
