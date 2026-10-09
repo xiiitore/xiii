@@ -1,4 +1,4 @@
-""""MCP server with HTTP Bearer-token authentication at the transport boundary."""
+"""MCP server with HTTP Bearer-token authentication at the transport boundary."""
 import hmac
 import json
 import os
