@@ -14,8 +14,10 @@ class ServerAuthTests(unittest.TestCase):
             server.mcp.streamable_http_app(), server._token_is_valid
         )
         self.client = TestClient(self.app)
+        self.client.__enter__()
 
     def tearDown(self):
+        self.client.__exit__(None, None, None)
         self.token_patch.stop()
 
     def test_real_mcp_route_rejects_missing_and_wrong_credentials(self):
