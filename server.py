@@ -1,31 +1,69 @@
+"""MCP server with HTTP Bearer-token authentication at the transport boundary."""
 import hmac
+import json
 import os
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+
 import core
+
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", 8000))
+_API_TOKEN = os.environ.get("MCP_API_TOKEN", "")
 
 mcp = FastMCP(
     "verification-controller",
     stateless_http=True,
     json_response=True,
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", 8000)),
+    host=HOST,
+    port=PORT,
 )
-_API_TOKEN = os.environ.get("MCP_API_TOKEN", "")
 
 
-def _authorize(access_token: str) -> None:
+def _token_is_valid(scope) -> bool:
+    """Validate Authorization: Bearer ... without placing secrets in tool arguments."""
     if not _API_TOKEN:
-        raise RuntimeError("MCP_API_TOKEN nije konfiguriran; servis je zatvoren")
-    if not isinstance(access_token, str) or not hmac.compare_digest(access_token, _API_TOKEN):
-        raise PermissionError("neautoriziran zahtjev")
+        return False
+    supplied = None
+    for name, value in scope.get("headers", []):
+        if name.lower() == b"authorization":
+            supplied = value.decode("latin-1")
+            break
+    if not supplied or not supplied.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(supplied[7:], _API_TOKEN)
+
+
+class BearerAuthMiddleware:
+    """Small ASGI middleware protecting the MCP HTTP endpoint."""
+
+    def __init__(self, app, token_is_valid):
+        self.app = app
+        self.token_is_valid = token_is_valid
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            if not self.token_is_valid(scope):
+                body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                        (b"www-authenticate", b"Bearer"),
+                        (b"cache-control", b"no-store"),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
 
 
 @mcp.tool()
-def recompute_check(expression: str, claimed_result: float, rel_tolerance: float = 1e-6,
-                    access_token: str = "") -> dict:
-    """Neovisno preračunaj izraz. Potreban je MCP_API_TOKEN."""
-    _authorize(access_token)
+def recompute_check(expression: str, claimed_result: float, rel_tolerance: float = 1e-6) -> dict:
+    """Recompute a bounded mathematical expression and compare it with a claim."""
     try:
         return core.check_number(expression, claimed_result, rel_tolerance)
     except (ValueError, TypeError, ArithmeticError) as exc:
@@ -33,35 +71,31 @@ def recompute_check(expression: str, claimed_result: float, rel_tolerance: float
 
 
 @mcp.tool()
-def register_claim(claim: str, source_tool: str = "", access_token: str = "") -> dict:
-    """Upiši tvrdnju u ledger. Potreban je MCP_API_TOKEN."""
-    _authorize(access_token)
+def register_claim(claim: str, source_tool: str = "") -> dict:
+    """Record a claim in the ledger with initial state EXECUTED."""
     return core.register(claim, source_tool)
 
 
 @mcp.tool()
-def advance_claim(claim_id: str, new_state: str, evidence: str = "",
-                  access_token: str = "") -> dict:
-    """Promijeni stanje tvrdnje za jedan korak uz obavezni dokazni zapis."""
-    _authorize(access_token)
+def advance_claim(claim_id: str, new_state: str, evidence: str = "") -> dict:
+    """Advance a claim one state at a time or reject it with a reason."""
     return core.advance(claim_id, new_state, evidence)
 
 
 @mcp.tool()
-def get_claim(claim_id: str, access_token: str = "") -> dict:
-    """Vrati stanje i povijest tvrdnje. Potreban je MCP_API_TOKEN."""
-    _authorize(access_token)
+def get_claim(claim_id: str) -> dict:
+    """Return the current state and history of one claim."""
     return core.get(claim_id)
 
 
 @mcp.tool()
-def list_claims(access_token: str = "") -> list:
-    """Vrati popis tvrdnji. Potreban je MCP_API_TOKEN."""
-    _authorize(access_token)
+def list_claims() -> list:
+    """List claim IDs, text, and current states."""
     return core.listing()
 
 
 if __name__ == "__main__":
     if not _API_TOKEN:
-        raise SystemExit("Postavi MCP_API_TOKEN prije pokretanja; servis se neće pokrenuti otvoren.")
-    mcp.run(transport="streamable-http")
+        raise SystemExit("Set MCP_API_TOKEN before starting; refusing to run without authentication.")
+    app = BearerAuthMiddleware(mcp.streamable_http_app(), _token_is_valid)
+    uvicorn.run(app, host=HOST, port=PORT)
