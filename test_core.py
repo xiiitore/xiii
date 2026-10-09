@@ -64,17 +64,17 @@ class LedgerTests(unittest.TestCase):
         core.advance(item["id"], "REJECTED", "contradictory evidence")
         self.assertIn("error", core.advance(item["id"], "VALID", "retry"))
 
-    def test_corrupt_ledger_fails_closed(self):
+    def test_corrupt_ledger_fails_closed_without_detail_leak(self):
         with open(self.path, "w", encoding="utf-8") as stream:
             stream.write("{broken")
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "^ledger cannot be read safely$"):
             core.listing()
 
-    def test_save_is_valid_json_and_no_temp_file_remains(self):
+    def test_save_is_valid_json_and_lock_file_is_created(self):
         core.register("persist")
         with open(self.path, encoding="utf-8") as stream:
             self.assertIsInstance(json.load(stream), dict)
-        self.assertEqual(os.listdir(self.temp.name), ["ledger.json"])
+        self.assertEqual(set(os.listdir(self.temp.name)), {"ledger.json", "ledger.json.lock"})
 
 
 if __name__ == "__main__":
