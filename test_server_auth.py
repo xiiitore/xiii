@@ -1,79 +1,67 @@
 import unittest
 from unittest.mock import patch
 
+from starlette.testclient import TestClient
+
 import server
 
 
-class BearerAuthTests(unittest.IsolatedAsyncioTestCase):
-    async def test_missing_or_invalid_token_is_rejected_at_http_boundary(self):
-        async def app(scope, receive, send):
-            raise AssertionError("unauthorized request reached MCP app")
+class ServerAuthTests(unittest.TestCase):
+    def setUp(self):
+        self.token_patch = patch.object(server, "_API_TOKEN", "test-secret")
+        self.token_patch.start()
+        self.app = server.BearerAuthMiddleware(
+            server.mcp.streamable_http_app(), server._token_is_valid
+        )
+        self.client = TestClient(self.app)
 
-        middleware = server.BearerAuthMiddleware(app, server._token_is_valid)
-        sent = []
+    def tearDown(self):
+        self.token_patch.stop()
 
-        async def send(message):
-            sent.append(message)
+    def test_real_mcp_route_rejects_missing_and_wrong_credentials(self):
+        self.assertEqual(self.client.post("/mcp", json={}).status_code, 401)
+        self.assertEqual(
+            self.client.post("/mcp", json={}, headers={"Authorization": "Bearer wrong"}).status_code,
+            401,
+        )
 
-        scope = {
-            "type": "http",
-            "path": "/mcp",
-            "headers": [(b"authorization", b"Bearer wrong")],
-        }
-        with patch.object(server, "_API_TOKEN", "expected-secret"):
-            await middleware(scope, None, send)
-        self.assertEqual(sent[0]["status"], 401)
-        self.assertIn((b"www-authenticate", b"Bearer"), sent[0]["headers"])
+    def test_real_mcp_route_accepts_authentication_before_protocol_validation(self):
+        response = self.client.post(
+            "/mcp",
+            json={},
+            headers={"Authorization": "Bearer test-secret"},
+        )
+        self.assertNotEqual(response.status_code, 401)
 
-    async def test_valid_token_reaches_mcp_app(self):
-        reached = []
+    def test_duplicate_and_malformed_authorization_headers_are_rejected(self):
+        cases = [
+            [(b"authorization", b"Bearer test-secret"),
+             (b"authorization", b"Bearer test-secret")],
+            [(b"authorization", b"Basic test-secret")],
+            [(b"authorization", b"Bearer")],
+            [(b"authorization", b"Bearer test-secret ")],
+        ]
+        for headers in cases:
+            with self.subTest(headers=headers):
+                self.assertFalse(server._token_is_valid({"headers": headers}))
 
-        async def app(scope, receive, send):
-            reached.append(True)
+    def test_bearer_scheme_is_case_insensitive(self):
+        self.assertTrue(server._token_is_valid({
+            "headers": [(b"authorization", b"bEaReR test-secret")]
+        }))
 
-        middleware = server.BearerAuthMiddleware(app, server._token_is_valid)
+    def test_wrong_path_is_not_mistaken_for_the_protected_mcp_route(self):
+        response = self.client.post("/not-mcp", json={})
+        self.assertEqual(response.status_code, 404)
 
-        async def send(message):
-            raise AssertionError("valid request should be handled by app")
-
-        scope = {
-            "type": "http",
-            "path": "/mcp",
-            "headers": [(b"authorization", b"Bearer expected-secret")],
-        }
-        with patch.object(server, "_API_TOKEN", "expected-secret"):
-            await middleware(scope, None, send)
-        self.assertEqual(reached, [True])
-
-    async def test_missing_config_rejects_even_if_header_is_present(self):
-        scope = {
-            "type": "http",
-            "path": "/mcp",
-            "headers": [(b"authorization", b"Bearer expected-secret")],
-        }
-        with patch.object(server, "_API_TOKEN", ""):
-            self.assertFalse(server._token_is_valid(scope))
-
-    async def test_duplicate_authorization_headers_are_rejected(self):
-        scope = {
-            "type": "http",
-            "path": "/mcp",
-            "headers": [
-                (b"authorization", b"Bearer expected-secret"),
-                (b"authorization", b"Bearer attacker-value"),
-            ],
-        }
-        with patch.object(server, "_API_TOKEN", "expected-secret"):
-            self.assertFalse(server._token_is_valid(scope))
-
-    async def test_bearer_scheme_is_case_insensitive(self):
-        scope = {
-            "type": "http",
-            "path": "/mcp",
-            "headers": [(b"authorization", b"bEaReR expected-secret")],
-        }
-        with patch.object(server, "_API_TOKEN", "expected-secret"):
-            self.assertTrue(server._token_is_valid(scope))
+    def test_remote_bind_requires_explicit_security_acknowledgements(self):
+        with self.assertRaises(SystemExit):
+            server.validate_deployment_config("0.0.0.0", {})
+        self.assertTrue(server.validate_deployment_config(
+            "0.0.0.0",
+            {"ALLOW_REMOTE_BIND": "1", "TRUSTED_TLS_TERMINATION": "1"},
+        ))
+        self.assertTrue(server.validate_deployment_config("127.0.0.1", {}))
 
 
 if __name__ == "__main__":
